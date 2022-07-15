@@ -47,6 +47,16 @@ class MoCoPPOTorchPolicy(TorchPolicy, LearningRateSchedule, EntropyCoeffSchedule
         self.kl_coeff = self.config["kl_coeff"]
         # Constant target value.
         self.kl_target = self.config["kl_target"]
+        self.count_train = 0  # 训练纪次
+        self.history_model_save_interval = self.config["history_model_save_interval"]  # 历史模型保存间隔
+        self.history_model_save_upper = self.config["history_model_save_upper"]  # 历史模型保存上限
+        self.history_model = []  # 历史模型集合
+        self.moco_pool_upper = self.config["moco_pool_upper"]  # moco 蓄水池大小
+        self.moco_reward_pool = np.array([])  # 历史收益纪录
+        self.moco_elo_pool = np.array([])  # 历史elo纪录
+        self.elo_compare_time = self.config["elo_compare_time"]  # 比较次数
+        self.elo_eta = self.config["elo_eta"]
+        self.elo_K = self.config["elo_K"]
         # TODO: Don't require users to call this manually.
         self._initialize_loss_from_dummy_batch()
 
@@ -78,6 +88,57 @@ class MoCoPPOTorchPolicy(TorchPolicy, LearningRateSchedule, EntropyCoeffSchedule
         Returns:
             The PPO loss tensor given the input batch.
         """
+
+        def get_elo_point(elo_value, elo_reward, moco_value, moco_reward):
+            """
+            计算新的elo分
+            :param elo_value:
+            :param elo_reward:
+            :param moco_value:
+            :param moco_reward:
+            :return:
+            """
+            compare_ans = np.float64(
+                elo_reward > moco_reward
+            )
+            compare_ans_tmp = np.float64(
+                elo_reward == moco_reward
+            )
+            compare_ans = compare_ans + 0.5 * compare_ans_tmp
+            op_compare_ans = 1 - compare_ans
+            # TODO：探索时间长度和结果之间的关系
+            time_step = elo_reward % 1000
+            op_time_step = moco_reward % 1000
+            time_step = 100
+            op_time_step = 100
+
+            gap_value_fn_out = moco_value * op_time_step - elo_value * time_step
+            win_rate_evaluation = 1 / (1 + (10 ** (gap_value_fn_out / self.elo_eta)))
+            op_win_rate_evaluation = 1 - win_rate_evaluation
+
+            next_elo_value = elo_value + self.elo_K * (compare_ans - win_rate_evaluation) / time_step
+            op_next_elo_value = moco_value + self.elo_K * (op_compare_ans - op_win_rate_evaluation) / op_time_step
+
+            return next_elo_value, op_next_elo_value
+
+        def get_compare_result(compare_time, elo_value, elo_reward, moco_elo_pool, moco_reward_pool):
+            # elo_value2=copy.deepcopy(elo_value)
+            for _ in range(compare_time):
+                tmp_shuffle_order = np.arange(len(moco_elo_pool))
+                np.random.shuffle(tmp_shuffle_order)
+                tmp_shuffle_order = tmp_shuffle_order[:len(elo_value)]
+                tmp_moco_elo = moco_elo_pool[tmp_shuffle_order]
+                tmp_moco_reward = moco_reward_pool[tmp_shuffle_order]
+
+                elo_value[:], moco_value = get_elo_point(elo_value, elo_reward, tmp_moco_elo, tmp_moco_reward)
+                # moco_elo_pool[tmp_shuffle_order] = moco_value
+            # assert self.count_train < 200, str(elo_reward) + '\n' + str(elo_value) + '\n' + str(elo_value2)
+
+        # 间隔一定时间 保存历史模型
+        self.count_train += 1
+        if self.count_train % self.history_model_save_interval == 0 and self.history_model_save_upper != 0:
+            self.history_model.append(model)
+            self.history_model = self.history_model[-self.history_model_save_upper:]
 
         logits, state = model(train_batch)
         curr_action_dist = dist_class(logits, model)
@@ -130,14 +191,75 @@ class MoCoPPOTorchPolicy(TorchPolicy, LearningRateSchedule, EntropyCoeffSchedule
         # Compute a value function loss.
         if self.config["use_critic"]:
             prev_value_fn_out = train_batch[SampleBatch.VF_PREDS]
-            value_fn_out = model.value_function()
+            value_fn_out = model.value_function()  # 现在的value 不能变
+            moco_target = value_fn_out.clone()  # 计算后的value 需要变
+            if self.config['num_gpus'] == 0:
+                next_value_fn_out = moco_target.detach().numpy()
+                true_reward = train_batch[Postprocessing.VALUE_TARGETS].detach().numpy()
+            else:
+                next_value_fn_out = moco_target.detach().cpu().numpy()
+                true_reward = train_batch[Postprocessing.VALUE_TARGETS].detach().cpu().numpy()
+
+            last_num = true_reward[0]
+            if true_reward[0] == 0:
+                for tmp_i in range(len(true_reward)):
+                    if true_reward[tmp_i] != 0:
+                        last_num = true_reward[tmp_i]
+                        break
+            # 消除lstm的0
+
+            for tmp_i in range(len(true_reward)):
+                if true_reward[tmp_i] == 0:
+                    true_reward[tmp_i] = last_num
+                else:
+                    last_num = true_reward[tmp_i]
+
+            moco_elo_value_fn_out = copy.deepcopy(next_value_fn_out)
+            for tmp_model in self.history_model:
+                tmp_model(train_batch)
+                tmp_elo_value_fn_out = tmp_model.value_function()
+                if self.config['num_gpus'] == 0:
+                    tmp_elo_value_fn_out = tmp_elo_value_fn_out.detach().numpy()
+                else:
+                    tmp_elo_value_fn_out = tmp_elo_value_fn_out.detach().cpu().numpy()
+                moco_elo_value_fn_out += tmp_elo_value_fn_out
+
+            moco_elo_value_fn_out = moco_elo_value_fn_out / (len(self.history_model) + 1)
+
+            self.moco_elo_pool = np.append(self.moco_elo_pool, moco_elo_value_fn_out)
+            self.moco_reward_pool = np.append(self.moco_reward_pool, true_reward)
+            self.moco_elo_pool = self.moco_elo_pool[-self.moco_pool_upper:]
+            self.moco_reward_pool = self.moco_reward_pool[-self.moco_pool_upper:]
+
+            get_compare_result(
+                self.elo_compare_time,
+                next_value_fn_out,
+                true_reward,
+                self.moco_elo_pool,
+                self.moco_reward_pool
+            )
+
+            # if self.count_train > 3000:
+            #     assert False, 'moco_elo_value_fn_out' + '\n' \
+            #                   + str(moco_elo_value_fn_out) + '\n' \
+            #                   + 'next_value_fn_out' + '\n' \
+            #                   + str(next_value_fn_out) + '\n' \
+            #                   + 'true_reward' + '\n' \
+            #                   + str(true_reward) + '\n'
+
             vf_loss1 = torch.pow(
-                value_fn_out - train_batch[Postprocessing.VALUE_TARGETS], 2.0)
+                value_fn_out - moco_target,
+                2.0
+            )
             vf_clipped = prev_value_fn_out + torch.clamp(
                 value_fn_out - prev_value_fn_out,
-                -self.config["vf_clip_param"], self.config["vf_clip_param"])
+                -self.config["vf_clip_param"],
+                self.config["vf_clip_param"]
+            )
             vf_loss2 = torch.pow(
-                vf_clipped - train_batch[Postprocessing.VALUE_TARGETS], 2.0)
+                vf_clipped - moco_target,
+                2.0
+            )
             vf_loss = torch.max(vf_loss1, vf_loss2)
             mean_vf_loss = reduce_mean_valid(vf_loss)
 

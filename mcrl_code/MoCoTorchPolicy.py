@@ -37,7 +37,6 @@ from ray.rllib.utils.typing import GradInfoDict, ModelGradients, \
     ModelWeights, TensorType, TensorStructType, TrainerConfigDict
 from ray.rllib.evaluation.postprocessing import compute_gae_for_sample_batch, \
     Postprocessing
-import gc
 
 if TYPE_CHECKING:
     from ray.rllib.evaluation import Episode  # noqa
@@ -278,18 +277,6 @@ class TorchPolicy(Policy):
             callable(get_batch_divisibility_req) else \
             (get_batch_divisibility_req or 1)
         self.count_train = 0
-        self.moco_pool_upper = self.config["moco_pool_upper"]  # moco 蓄水池大小
-        self.elo_compare_time = self.config["elo_compare_time"]  # 比较次数
-        self.elo_batch_pool = []
-        self.elo_eta = self.config["elo_eta"]
-        self.elo_K = self.config["elo_K"]
-        self.once_compare_tra_num = self.config['once_compare_tra_num']
-
-        self.tra_ids = []
-        self.tra_sum_rewards = []
-        self.fix_tra_sum_rewards = []
-        self.tra_true_rewards = []
-        self.tra_lens = []  # 平均长度
 
     @override(Policy)
     def compute_actions_from_input_dict(
@@ -470,147 +457,26 @@ class TorchPolicy(Policy):
             batch: SampleBatch,
             buffer_index: int = 0,
     ) -> int:
-        def get_elo_point(elo_value, elo_reward, moco_value, moco_reward, elo_eta, elo_K):
-            """
-            计算新的elo分
-            :param elo_value:
-            :param elo_reward:
-            :param moco_value:
-            :param moco_reward:
-            :return:
-            """
-            moco_reward2 = moco_reward + np.random.randn(len(moco_reward)) * 0
-            compare_ans = np.float64(
-                elo_reward > moco_reward2
-            )
-            compare_ans_tmp = np.float64(
-                elo_reward == moco_reward2
-            )
-            compare_ans = compare_ans + 0.5 * compare_ans_tmp
-            # for tmp_ii in range(len(compare_ans)):
-            #     if np.random.rand() < 0.1:
-            #         compare_ans[tmp_ii] = 1 - compare_ans[tmp_ii]
-
-            gap_value_fn_out = moco_value - elo_value
-            win_rate_evaluation = 1 / (1 + (10 ** (gap_value_fn_out / elo_eta)))
-
-            next_elo_value = elo_value + elo_K * (compare_ans - win_rate_evaluation)
-
-            return next_elo_value
-
-        def get_compare_result(elo_value, elo_reward, moco_elo_pool, moco_reward_pool, elo_eta, elo_K):
-            tmp_shuffle_order = np.arange(len(moco_elo_pool))
-            np.random.shuffle(tmp_shuffle_order)
-            tmp_shuffle_order = tmp_shuffle_order[:len(elo_value)]
-
-            tmp_moco_elo = moco_elo_pool[tmp_shuffle_order]
-            tmp_moco_reward = moco_reward_pool[tmp_shuffle_order]
-            elo_value = get_elo_point(
-                elo_value,
-                elo_reward,
-                tmp_moco_elo,
-                tmp_moco_reward,
-                elo_eta,
-                elo_K
-            )
-            return elo_value
-
-        self.count_train += 1
-
-        tmp_id_pool = []
-        for tmp_batch in self.elo_batch_pool:
-            tmp_id_pool.append(tmp_batch['eps_id'][0])
-
-        if batch['eps_id'][0] in self.tra_ids:
+        if self.config['model']['use_lstm']:
             pass
         else:
-            tmp_batch_episode = batch.split_by_episode()
-            tmp_ids = []
-            tmp_sum_rewards = []
-            tmp_true_rewards = []
-            tmp_lens = []  # 平均长度
-            for tmp_batch in tmp_batch_episode:
-                tmp_ids.append(tmp_batch['eps_id'][0])
-                tmp_i_sum_reward = 0
-                for tmp_i_t in range(len(tmp_batch['vf_preds']) - 1):
-                    tmp_i_reward = tmp_batch['vf_preds'][tmp_i_t] - 0.99 * tmp_batch['vf_preds'][tmp_i_t + 1]
-                    tmp_i_sum_reward += tmp_i_reward
-                tmp_sum_rewards.append(tmp_i_sum_reward)
-                tmp_true_rewards.append(tmp_batch['value_targets'][0])
-                tmp_lens.append(len(tmp_batch['vf_preds']))
-            self.tra_ids.extend(tmp_ids)
-            self.tra_sum_rewards.extend(tmp_sum_rewards)
-            self.fix_tra_sum_rewards.extend(tmp_sum_rewards)
-            self.tra_true_rewards.extend(tmp_true_rewards)
-            self.tra_lens.extend(tmp_lens)
+            batch.shuffle()
 
-            self.elo_batch_pool.extend(batch.split_by_episode())
+        batch.set_training(True)
 
-        if len(self.elo_batch_pool) > self.moco_pool_upper:
-            self.elo_batch_pool = self.elo_batch_pool[-self.moco_pool_upper:]
-            self.tra_ids = self.tra_ids[-self.moco_pool_upper:]
-            self.tra_sum_rewards = self.tra_sum_rewards[-self.moco_pool_upper:]
-            self.tra_true_rewards = self.tra_true_rewards[-self.moco_pool_upper:]
-            self.tra_lens = self.tra_lens[-self.moco_pool_upper:]
-            self.fix_tra_sum_rewards = self.fix_tra_sum_rewards[-self.moco_pool_upper:]
-        self.tra_sum_rewards = np.array(self.tra_sum_rewards)
-        self.tra_true_rewards = np.array(self.tra_true_rewards)
-        self.tra_sum_rewards = self.tra_sum_rewards * 0.5
-        for _ in range(self.elo_compare_time):
-            self.tra_sum_rewards = get_compare_result(
-                self.tra_sum_rewards,
-                self.tra_true_rewards,
-                copy.deepcopy(self.tra_sum_rewards),
-                copy.deepcopy(self.tra_true_rewards),
-                np.mean(self.tra_lens) * self.elo_eta,
-                np.mean(self.tra_lens) * self.elo_eta * self.elo_K
-            )
-
-        self.tra_sum_rewards = self.tra_sum_rewards - np.mean(self.tra_sum_rewards)
-
-        self.tra_sum_rewards = list(self.tra_sum_rewards)
-        self.tra_true_rewards = list(self.tra_true_rewards)
-
-        use_batch = np.array(list(range(len(self.elo_batch_pool))))
-        np.random.shuffle(use_batch)
-        use_batch = use_batch[-self.once_compare_tra_num:]
-        len_use_batch = len(use_batch)
-
-        td_error = (np.array(self.tra_sum_rewards) - np.array(self.fix_tra_sum_rewards)) / np.array(self.tra_lens)
-
-        train_batch = []
-        for i_batch in range(len_use_batch):
-            tmp_batch = self.elo_batch_pool[use_batch[i_batch]].copy()
-
-            for i_t in range(len(tmp_batch['value_targets'])):
-                tmp_batch['value_targets'][i_t] = td_error[use_batch[i_batch]]
-            train_batch.append(tmp_batch)
-
-        batch2 = train_batch[0].copy()
-        for i_batch in range(1, len_use_batch):
-            batch2 = batch2.concat(train_batch[i_batch])
-
-        # if self.count_train > 5:
-        #     assert False, str(td_error) + '\n' \
-        #                   + str(self.tra_true_rewards) + '\n' \
-        #                   + str(np.around(self.tra_sum_rewards, 3)) + '\n' \
-        #                   + str(np.around(self.fix_tra_sum_rewards, 3))
-
-        batch2.set_training(True)
-
-        # Shortcut for 1 CPU only: Store batch2 in `self._loaded_batches`.
+        # Shortcut for 1 CPU only: Store batch in `self._loaded_batches`.
         if len(self.devices) == 1 and self.devices[0].type == "cpu":
             assert buffer_index == 0
             pad_batch_to_sequences_of_same_size(
-                batch=batch2,
+                batch=batch,
                 max_seq_len=self.max_seq_len,
                 shuffle=False,
                 batch_divisibility_req=self.batch_divisibility_req,
                 view_requirements=self.view_requirements,
             )
-            self._lazy_tensor_dict(batch2)
-            self._loaded_batches[0] = [batch2]
-            return len(batch2)
+            self._lazy_tensor_dict(batch)
+            self._loaded_batches[0] = [batch]
+            return len(batch)
 
         # Batch (len=28, seq-lens=[4, 7, 4, 10, 3]):
         # 0123 0123456 0123 0123456789ABC
@@ -619,7 +485,7 @@ class TorchPolicy(Policy):
         # [0123 0123456] [012] [3 0123456789 ABC]
         # (len=14, 14 seq-lens=[4, 7, 3] [1, 10, 3])
 
-        slices = batch2.timeslices(num_slices=len(self.devices))
+        slices = batch.timeslices(num_slices=len(self.devices))
 
         # 2) zero-padding (max-seq-len=10).
         # - [0123000000 0123456000 0120000000]
@@ -639,7 +505,7 @@ class TorchPolicy(Policy):
         ]
 
         self._loaded_batches[buffer_index] = slices
-        gc.collect()
+
         # Return loaded samples per-device.
         return len(slices[0])
 

@@ -1,0 +1,5 @@
+numpy
+ray[rllib]
+gym[atari]
+gym[accept-rom-license]
+atari_py
