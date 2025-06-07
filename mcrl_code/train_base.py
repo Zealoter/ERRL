@@ -57,7 +57,7 @@ if __name__ == "__main__":
         # keep_checkpoints_num=10,
         # checkpoint_freq=50,
         checkpoint_at_end=True,
-        # local_dir='/Users/juqi/Desktop/居奇综合/Gitee/论文1/rl_paper1/result'
+        # local_dir=''
     )
     print('elapsed time=', time.time() - st)
     ray.shutdown()
